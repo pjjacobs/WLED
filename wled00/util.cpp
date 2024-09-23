@@ -617,3 +617,10 @@ uint8_t get_random_wheel_index(uint8_t pos) {
 float mapf(float x, float in_min, float in_max, float out_min, float out_max) {
   return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
+
+uint32_t hashInt(uint32_t s) {
+  // borrowed from https://stackoverflow.com/questions/664014/what-integer-hash-function-are-good-that-accepts-an-integer-hash-key
+  s = ((s >> 16) ^ s) * 0x45d9f3b;
+  s = ((s >> 16) ^ s) * 0x45d9f3b;
+  return (s >> 16) ^ s;
+}
