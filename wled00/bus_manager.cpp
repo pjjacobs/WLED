@@ -21,7 +21,36 @@
 #include "bus_wrapper.h"
 #include "bus_manager.h"
 
+// functions to get/set bits in an array - based on functions created by Brandon for GOL
+//  toDo : make this a class that's completely defined in a header file
+bool getBitFromArray(const uint8_t* byteArray, size_t position) { // get bit value
+    size_t byteIndex = position / 8;
+    unsigned bitIndex = position % 8;
+    uint8_t byteValue = byteArray[byteIndex];
+    return (byteValue >> bitIndex) & 1;
+}
 extern bool cctICused;
+
+void setBitInArray(uint8_t* byteArray, size_t position, bool value) {  // set bit - with error handling for nullptr
+    //if (byteArray == nullptr) return;
+    size_t byteIndex = position / 8;
+    unsigned bitIndex = position % 8;
+    if (value)
+        byteArray[byteIndex] |= (1 << bitIndex); 
+    else
+        byteArray[byteIndex] &= ~(1 << bitIndex);
+}
+
+size_t getBitArrayBytes(size_t num_bits) { // number of bytes needed for an array with num_bits bits
+  return (num_bits + 7) / 8; 
+}
+
+void setBitArray(uint8_t* byteArray, size_t numBits, bool value) {  // set all bits to same value
+  if (byteArray == nullptr) return;
+  size_t len =  getBitArrayBytes(numBits);
+  if (value) memset(byteArray, 0xFF, len);
+  else memset(byteArray, 0x00, len);
+}
 
 //colors.cpp
 uint32_t colorBalanceFromKelvin(uint16_t kelvin, uint32_t rgb);
@@ -784,6 +813,297 @@ void BusNetwork::cleanup() {
   freeData();
 }
 
+// ***************************************************************************
+
+#ifdef WLED_ENABLE_HUB75MATRIX
+#ifdef ESP8266
+#error ESP8266 does not support HUB75
+#endif 
+
+BusHub75Matrix::BusHub75Matrix(BusConfig &bc) : Bus(bc.type, bc.start, bc.autoWhite) {
+
+  _valid = false;
+  _hasRgb = true;
+  _hasWhite = false;
+
+  mxconfig.double_buff = false; // default to off, known to cause issue with some effects but needs more memory
+  // mxconfig.driver = HUB75_I2S_CFG::ICN2038S;  // experimental - use specific shift register driver
+  //mxconfig.latch_blanking = 3;
+  // mxconfig.i2sspeed = HUB75_I2S_CFG::HZ_10M;  // experimental - 5MHZ should be enugh, but colours looks slightly better at 10MHz
+  //mxconfig.min_refresh_rate = 90;
+  //mxconfig.min_refresh_rate = 120;
+  mxconfig.clkphase = bc.reversed;
+
+  fourScanPanel = nullptr;
+
+  if (bc.type == TYPE_HUB75MATRIX_HS) {
+      mxconfig.mx_width = min((u_int8_t) 64, bc.pins[0]);
+      mxconfig.mx_height = min((u_int8_t) 64, bc.pins[1]);
+  } else if (bc.type == TYPE_HUB75MATRIX_QS) {
+      mxconfig.mx_width = min((u_int8_t) 64, bc.pins[0]) * 2;
+      mxconfig.mx_height = min((u_int8_t) 64, bc.pins[1]) / 2;  
+      fourScanPanel = new VirtualMatrixPanel((*display), 1, 1, bc.pins[0], bc.pins[1]);
+      fourScanPanel->setRotation(0);
+      switch(bc.pins[1]) {
+        case 16:
+          fourScanPanel->setPhysicalPanelScanRate(FOUR_SCAN_16PX_HIGH);
+          break;
+        case 32:
+          fourScanPanel->setPhysicalPanelScanRate(FOUR_SCAN_32PX_HIGH);
+          break;
+        case 64:
+          fourScanPanel->setPhysicalPanelScanRate(FOUR_SCAN_64PX_HIGH);
+          break;
+        default:
+          DEBUG_PRINTLN("Unsupported height");
+          return;
+      }
+  } else {
+    DEBUG_PRINTLN("Unknown type");
+    return;
+  }  
+
+
+  mxconfig.chain_length = max((u_int8_t) 1, min(bc.pins[2], (u_int8_t) 4)); // prevent bad data preventing boot due to low memory
+
+  if(mxconfig.mx_height >= 64 && (mxconfig.chain_length > 1)) {
+    DEBUG_PRINTLN("WARNING, only single panel can be used of 64 pixel boards due to memory");
+    mxconfig.chain_length = 1;
+  }
+
+
+//  HUB75_I2S_CFG::i2s_pins _pins={R1_PIN, G1_PIN, B1_PIN, R2_PIN, G2_PIN, B2_PIN, A_PIN, B_PIN, C_PIN, D_PIN, E_PIN, LAT_PIN, OE_PIN, CLK_PIN};
+
+#if defined(ARDUINO_ADAFRUIT_MATRIXPORTAL_ESP32S3) // MatrixPortal ESP32-S3
+
+  // https://www.adafruit.com/product/5778
+  DEBUG_PRINTLN("MatrixPanel_I2S_DMA - Matrix Portal S3 config");
+  mxconfig.gpio = { 42, 41, 40, 38, 39, 37,  45, 36, 48, 35, 21, 47, 14, 2 }; 
+
+#elif defined(ESP32_FORUM_PINOUT) // Common format for boards designed for SmartMatrix
+
+  DEBUG_PRINTLN("MatrixPanel_I2S_DMA - ESP32_FORUM_PINOUT");
+/*
+    ESP32 with SmartMatrix's default pinout - ESP32_FORUM_PINOUT
+    https://github.com/pixelmatix/SmartMatrix/blob/teensylc/src/MatrixHardware_ESP32_V0.h
+    Can use a board like https://github.com/rorosaurus/esp32-hub75-driver
+*/
+
+ mxconfig.gpio = { 2, 15, 4, 16, 27, 17, 5, 18, 19, 21, 12, 26, 25, 22 }; 
+
+#else
+  DEBUG_PRINTLN("MatrixPanel_I2S_DMA - Default pins");
+  /*
+   https://github.com/mrfaptastic/ESP32-HUB75-MatrixPanel-DMA?tab=readme-ov-file
+
+   Boards
+
+   https://esp32trinity.com/
+   https://www.electrodragon.com/product/rgb-matrix-panel-drive-interface-board-for-esp32-dma/
+   
+  */
+ mxconfig.gpio = { 25, 26, 27, 14, 12, 13, 23, 9, 5, 17, 18, 4, 15, 16 }; 
+
+#endif
+
+  int8_t pins[PIN_COUNT];
+  memcpy(pins, &mxconfig.gpio, sizeof(mxconfig.gpio));
+  PinManager::allocateMultiplePins(pins, PIN_COUNT, PinOwner::HUB75, true);
+
+  DEBUG_PRINTF("MatrixPanel_I2S_DMA config - %ux%u length: %u\n", mxconfig.mx_width, mxconfig.mx_height, mxconfig.chain_length);
+  DEBUG_PRINTF("R1_PIN=%u, G1_PIN=%u, B1_PIN=%u, R2_PIN=%u, G2_PIN=%u, B2_PIN=%u, A_PIN=%u, B_PIN=%u, C_PIN=%u, D_PIN=%u, E_PIN=%u, LAT_PIN=%u, OE_PIN=%u, CLK_PIN=%u\n",
+                mxconfig.gpio.r1, mxconfig.gpio.g1, mxconfig.gpio.b1, mxconfig.gpio.r2, mxconfig.gpio.g2, mxconfig.gpio.b2,
+                mxconfig.gpio.a, mxconfig.gpio.b, mxconfig.gpio.c, mxconfig.gpio.d, mxconfig.gpio.e, mxconfig.gpio.lat, mxconfig.gpio.oe, mxconfig.gpio.clk);
+
+  // OK, now we can create our matrix object
+  display = new MatrixPanel_I2S_DMA(mxconfig);
+
+  this->_len = (display->width() * display->height());
+  DEBUG_PRINTF("Length: %u\n", _len);
+  if(this->_len >= MAX_LEDS) {
+    DEBUG_PRINTLN("MatrixPanel_I2S_DMA Too many LEDS - playing safe");
+    return;
+  }
+
+  DEBUG_PRINTLN("MatrixPanel_I2S_DMA created");
+  // let's adjust default brightness
+  display->setBrightness8(25);    // range is 0-255, 0 - 0%, 255 - 100%
+
+  delay(24); // experimental
+  // Allocate memory and start DMA display
+  if( not display->begin() ) {
+      DEBUG_PRINTLN("****** MatrixPanel_I2S_DMA !KABOOM! I2S memory allocation failed ***********");
+      return;
+  }
+  else {
+    DEBUG_PRINTLN("MatrixPanel_I2S_DMA begin ok");
+    delay(18);   // experiment - give the driver a moment (~ one full frame @ 60hz) to settle
+    _valid = true;
+    display->clearScreen();   // initially clear the screen buffer
+    DEBUG_PRINTLN("MatrixPanel_I2S_DMA clear ok");
+
+    if (_ledBuffer) free(_ledBuffer);                 // should not happen
+    if (_ledsDirty) free(_ledsDirty);                 // should not happen
+    DEBUG_PRINTLN("MatrixPanel_I2S_DMA allocate memory");
+    _ledsDirty = (byte*) malloc(getBitArrayBytes(_len));  // create LEDs dirty bits
+   DEBUG_PRINTLN("MatrixPanel_I2S_DMA allocate memory ok");
+   
+    if (_ledsDirty == nullptr) {
+      display->stopDMAoutput();
+      delete display; display = nullptr;
+      _valid = false;
+      DEBUG_PRINTLN(F("MatrixPanel_I2S_DMA not started - not enough memory for dirty bits!"));
+      return;  //  fail is we cannot get memory for the buffer
+    }
+    setBitArray(_ledsDirty, _len, false);             // reset dirty bits
+
+    if (mxconfig.double_buff == false) {
+      _ledBuffer = (CRGB*) calloc(_len, sizeof(CRGB));  // create LEDs buffer (initialized to BLACK)
+    }
+  }
+  
+
+  if (_valid) {
+    _panelWidth = fourScanPanel ? fourScanPanel->width() : display->width();  // cache width - it will never change
+  }
+
+  DEBUG_PRINT(F("MatrixPanel_I2S_DMA "));
+  DEBUG_PRINTF("%sstarted, width=%u, %u pixels.\n", _valid? "":"not ", _panelWidth, _len);
+
+  if (mxconfig.double_buff == true) DEBUG_PRINTLN(F("MatrixPanel_I2S_DMA driver native double-buffering enabled."));
+  if (_ledBuffer != nullptr) DEBUG_PRINTLN(F("MatrixPanel_I2S_DMA LEDS buffer enabled."));
+  if (_ledsDirty != nullptr) DEBUG_PRINTLN(F("MatrixPanel_I2S_DMA LEDS dirty bit optimization enabled."));
+  if ((_ledBuffer != nullptr) || (_ledsDirty != nullptr)) {
+    DEBUG_PRINT(F("MatrixPanel_I2S_DMA LEDS buffer uses "));
+    DEBUG_PRINT((_ledBuffer? _len*sizeof(CRGB) :0) + (_ledsDirty? getBitArrayBytes(_len) :0));
+    DEBUG_PRINTLN(F(" bytes."));
+  }
+}
+
+void __attribute__((hot)) BusHub75Matrix::setPixelColor(uint16_t pix, uint32_t c) {
+  if (!_valid || pix >= _len) return;
+  // if (_cct >= 1900) c = colorBalanceFromKelvin(_cct, c); //color correction from CCT
+
+  if (_ledBuffer) {
+    CRGB fastled_col = CRGB(c);
+    if (_ledBuffer[pix] != fastled_col) {
+      _ledBuffer[pix] = fastled_col;
+      setBitInArray(_ledsDirty, pix, true);  // flag pixel as "dirty"
+    }
+  }
+  else {
+    if ((c == IS_BLACK) && (getBitFromArray(_ledsDirty, pix) == false)) return; // ignore black if pixel is already black
+    setBitInArray(_ledsDirty, pix, c != IS_BLACK);                              // dirty = true means "color is not BLACK"
+
+    #ifndef NO_CIE1931
+    c = unGamma24(c); // to use the driver linear brightness feature, we first need to undo WLED gamma correction
+    #endif
+    uint8_t r = R(c);
+    uint8_t g = G(c);
+    uint8_t b = B(c);
+
+    if(fourScanPanel != nullptr) {
+      int x = pix % _panelWidth;
+      int y = pix / _panelWidth;
+      fourScanPanel->drawPixelRGB888(int16_t(x), int16_t(y), r, g, b);
+    } else {
+      int x = pix % _panelWidth;
+      int y = pix / _panelWidth;
+      display->drawPixelRGB888(int16_t(x), int16_t(y), r, g, b);
+    }
+  }
+}
+
+uint32_t BusHub75Matrix::getPixelColor(uint16_t pix) const {
+  if (!_valid || pix >= _len) return IS_BLACK;
+  if (_ledBuffer)
+    return uint32_t(_ledBuffer[pix].scale8(_bri)) & 0x00FFFFFF;  // scale8() is needed to mimic NeoPixelBus, which returns scaled-down colours
+  else
+    return getBitFromArray(_ledsDirty, pix) ? IS_DARKGREY: IS_BLACK;   // just a hack - we only know if the pixel is black or not
+}
+
+void BusHub75Matrix::setBrightness(uint8_t b) {
+  _bri = b;
+  if (_bri > 238) _bri=238;
+  display->setBrightness(_bri);
+}
+
+void BusHub75Matrix::show(void) {
+  if (!_valid) return;
+  display->setBrightness(_bri);
+
+  if (_ledBuffer) {
+    // write out buffered LEDs
+    bool isFourScan = (fourScanPanel != nullptr);
+    //if (isFourScan) fourScanPanel->setRotation(0);
+    unsigned height = isFourScan ? fourScanPanel->height() : display->height();
+    unsigned width = _panelWidth;
+
+    //while(!previousBufferFree) delay(1);   // experimental - Wait before we allow any writing to the buffer. Stop flicker.
+
+    size_t pix = 0; // running pixel index
+    for (int y=0; y<height; y++) for (int x=0; x<width; x++) {
+      if (getBitFromArray(_ledsDirty, pix) == true) {        // only repaint the "dirty"  pixels
+        uint32_t c = uint32_t(_ledBuffer[pix]) & 0x00FFFFFF; // get RGB color, removing FastLED "alpha" component 
+        #ifndef NO_CIE1931
+        c = unGamma24(c); // to use the driver linear brightness feature, we first need to undo WLED gamma correction
+        #endif
+        uint8_t r = R(c);
+        uint8_t g = G(c);
+        uint8_t b = B(c);
+        if (isFourScan) fourScanPanel->drawPixelRGB888(int16_t(x), int16_t(y), r, g, b);
+        else display->drawPixelRGB888(int16_t(x), int16_t(y), r, g, b);
+      }
+      pix ++;
+    }
+    setBitArray(_ledsDirty, _len, false);  // buffer shown - reset all dirty bits
+  }
+
+  if(mxconfig.double_buff) {
+    display->flipDMABuffer(); // Show the back buffer, set current output buffer to the back (i.e. no longer being sent to LED panels)
+    // while(!previousBufferFree) delay(1);   // experimental - Wait before we allow any writing to the buffer. Stop flicker.
+    display->clearScreen();   // Now clear the back-buffer
+    setBitArray(_ledsDirty, _len, false);  // dislay buffer is blank - reset all dirty bits
+  }
+}
+
+void BusHub75Matrix::cleanup() {
+  if (display && _valid) display->stopDMAoutput();  // terminate DMA driver (display goes black)
+  _valid = false;
+  _panelWidth = 0;
+  deallocatePins();
+  DEBUG_PRINTLN("HUB75 output ended.");
+
+  //if (fourScanPanel != nullptr) delete fourScanPanel;  // warning: deleting object of polymorphic class type 'VirtualMatrixPanel' which has non-virtual destructor might cause undefined behavior
+  delete display;
+  display = nullptr;
+  fourScanPanel = nullptr;
+  if (_ledBuffer != nullptr) free(_ledBuffer); _ledBuffer = nullptr;
+  if (_ledsDirty != nullptr) free(_ledsDirty); _ledsDirty = nullptr;      
+}
+
+void BusHub75Matrix::deallocatePins() {
+  uint8_t pins[PIN_COUNT];
+  memcpy(pins, &mxconfig.gpio, sizeof(mxconfig.gpio));
+  PinManager::deallocateMultiplePins(pins, PIN_COUNT, PinOwner::HUB75);
+}
+
+std::vector<LEDType> BusHub75Matrix::getLEDTypes() {
+  return {
+    {TYPE_HUB75MATRIX_HS,     "H",     PSTR("HUB75 (Half Scan)")},
+    {TYPE_HUB75MATRIX_QS,     "H",     PSTR("HUB75 (Quarter Scan)")},
+  };
+}
+
+uint8_t BusHub75Matrix::getPins(uint8_t* pinArray) const {
+  pinArray[0] = mxconfig.mx_width;
+  pinArray[1] = mxconfig.mx_height;
+  pinArray[2] = mxconfig.chain_length;
+  return 3;
+}
+
+#endif
+// ***************************************************************************
 
 //utility to get the approx. memory usage of a given BusConfig
 uint32_t BusManager::memUsage(BusConfig &bc) {
@@ -815,6 +1135,10 @@ int BusManager::add(BusConfig &bc) {
   if (getNumBusses() - getNumVirtualBusses() >= WLED_MAX_BUSSES) return -1;
   if (Bus::isVirtual(bc.type)) {
     busses[numBusses] = new BusNetwork(bc);
+#ifdef WLED_ENABLE_HUB75MATRIX
+  } else if (Bus::isHub75(bc.type)) {
+    busses[numBusses] = new BusHub75Matrix(bc);
+#endif
   } else if (Bus::isDigital(bc.type)) {
     busses[numBusses] = new BusDigital(bc, numBusses, colorOrderMap);
   } else if (Bus::isOnOff(bc.type)) {
@@ -846,6 +1170,10 @@ String BusManager::getLEDTypesJSONString() {
   json += LEDTypesToJson(BusPwm::getLEDTypes());
   json += LEDTypesToJson(BusNetwork::getLEDTypes());
   //json += LEDTypesToJson(BusVirtual::getLEDTypes());
+  #ifdef WLED_ENABLE_HUB75MATRIX
+  json += LEDTypesToJson(BusHub75Matrix::getLEDTypes());
+  #endif
+
   json.setCharAt(json.length()-1, ']'); // replace last comma with bracket
   return json;
 }
